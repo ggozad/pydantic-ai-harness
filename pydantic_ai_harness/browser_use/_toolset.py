@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from fnmatch import fnmatch
 from typing import Literal, Protocol, overload
@@ -208,9 +208,17 @@ async def _kill(session: BrowserSession) -> bool:
         with anyio.move_on_after(_TEARDOWN_TIMEOUT) as timeout_scope:
             try:
                 await session.kill()
-            except Exception:
+            except (Exception, asyncio.CancelledError):
+                # A `CancelledError` here is either the timeout below -- its scope
+                # is inside the shield, so it lands on this await -- or one raised
+                # by `kill()` itself; the shield rules out external cancellation.
+                # Both retain the session, but a timeout reports itself, so do not
+                # blame the teardown for failing on top of it.
                 succeeded = False
-                logger.warning('browser-use session teardown failed; retaining the session for retry', exc_info=True)
+                if not timeout_scope.cancel_called:
+                    logger.warning(
+                        'browser-use session teardown failed; retaining the session for retry', exc_info=True
+                    )
         if timeout_scope.cancel_called:
             succeeded = False
             logger.warning(
@@ -218,6 +226,113 @@ async def _kill(session: BrowserSession) -> bool:
                 _TEARDOWN_TIMEOUT,
             )
     return succeeded
+
+
+@dataclass(frozen=True)
+class BrowserLease:
+    """A remote browser leased for a browse: its CDP endpoint and how to release it.
+
+    A `BrowserLeaseProvider` returns one per `browse_web` call (in `'call'`
+    scope) or once per shared session (in `'agent'` scope), so each lease owns a
+    freshly-provisioned remote browser (e.g. a Steel session) that is handed back
+    when the browse -- or the shared session -- ends. `release` runs in a
+    shielded, time-bounded teardown, on success, failure, and cancellation, and
+    is retried if it fails or times out, so it must be idempotent. `cdp_url` is
+    excluded from `repr` because remote endpoints often carry credentials.
+    """
+
+    cdp_url: str = field(repr=False)
+    """The CDP endpoint of the leased browser, as `BrowserUse.cdp_url` would take it.
+
+    Excluded from `repr` because a remote endpoint often carries a token.
+    """
+
+    release: Callable[[], Awaitable[None]]
+    """Hand the browser back, called once the lease is finished with.
+
+    Must be idempotent and scoped to this lease: a failed or timed-out release
+    is retried later, by which time another call may own the backend, and it
+    must not tear down a browser this lease no longer owns.
+    """
+
+
+class BrowserLeaseProvider(Protocol):
+    """Leases a remote browser for `browse_web` to drive.
+
+    Called once per `browse_web` call in `'call'` scope, or once for the shared
+    session in `'agent'` scope. Returning an awaitable rather than being
+    declared `async` keeps any callable that yields a `BrowserLease` eligible,
+    an `async def` provider included. Set it via
+    `BrowserUse.browser_lease_provider`, which is mutually exclusive with
+    `BrowserUse.cdp_url`.
+    """
+
+    def __call__(self) -> Awaitable[BrowserLease]:
+        """Provision a browser and return the lease that owns it."""
+        ...  # pragma: no cover
+
+
+@dataclass
+class _PendingResource:
+    """A leased browser awaiting cleanup: kill the client session, release the lease.
+
+    Each step is retried until it succeeds. Releasing the lease frees the remote
+    browser, so once it succeeds a client-side session kill is moot and dropped.
+    """
+
+    session: BrowserSession | None
+    lease: BrowserLease | None
+
+    @property
+    def done(self) -> bool:
+        return self.session is None and self.lease is None
+
+
+async def _release(lease: BrowserLease) -> bool:
+    """Release a lease, shielded and time-bounded like `_kill`. True when released.
+
+    Swallows and logs failures and timeouts -- release does network I/O and runs
+    in a `finally`, so a raise would replace whatever was unwinding through it --
+    and reports the outcome so a failed release can be retained for retry.
+    """
+    succeeded = True
+    with anyio.CancelScope(shield=True):
+        with anyio.move_on_after(_TEARDOWN_TIMEOUT) as timeout_scope:
+            try:
+                await lease.release()
+            except (Exception, asyncio.CancelledError):
+                # A `CancelledError` here is either the timeout below -- its scope
+                # is inside the shield, so it lands on this await -- or one raised
+                # by `release()` itself; the shield rules out external
+                # cancellation. Both retain the lease, but a timeout reports
+                # itself, so do not blame the callback for failing on top of it.
+                succeeded = False
+                if not timeout_scope.cancel_called:
+                    logger.warning('browser lease release failed; retaining for retry', exc_info=True)
+        if timeout_scope.cancel_called:
+            succeeded = False
+            logger.warning(
+                'browser lease release timed out after %s seconds; retaining for retry',
+                _TEARDOWN_TIMEOUT,
+            )
+    return succeeded
+
+
+async def _cleanup(resource: _PendingResource) -> bool:
+    """Kill the client session, then release the lease; True once both are done.
+
+    Kill first (a graceful client shutdown while the browser is alive), then
+    release (the authoritative teardown that frees the remote browser). A
+    successful release drops the session too: the remote browser is gone, so
+    retrying its kill would be meaningless. Each step is cleared as it succeeds,
+    so a retry only redoes what is left.
+    """
+    if resource.session is not None and await _kill(resource.session):
+        resource.session = None
+    if resource.lease is not None and await _release(resource.lease):
+        resource.lease = None
+        resource.session = None
+    return resource.done
 
 
 class BrowserAgentHistory(Protocol):
@@ -427,8 +542,11 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
         settings: BrowserAgentSettings,
         session_scope: Literal['call', 'agent'],
         cdp_url: str | None,
+        browser_lease_provider: BrowserLeaseProvider | None = None,
     ) -> None:
         super().__init__()
+        if cdp_url is not None and browser_lease_provider is not None:
+            raise ValueError('Set either `cdp_url` or `browser_lease_provider`, not both.')
         self._browser_agent = browser_agent
         self._llm = llm
         self._browser_profile = browser_profile
@@ -450,8 +568,10 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
         )
         self._session_scope: Literal['call', 'agent'] = session_scope
         self._cdp_url = cdp_url
+        self._browser_lease_provider = browser_lease_provider
         self._shared_session: BrowserSession | None = None
-        self._pending_cleanup: list[BrowserSession] = []
+        self._shared_lease: BrowserLease | None = None
+        self._pending_cleanup: list[_PendingResource] = []
         self._session_closed = False
         self._active_call_sessions = 0
         self._call_cleanup_in_progress = False
@@ -460,7 +580,7 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
         self._session_lock = asyncio.Lock()
         self.add_function(self.browse_web, name=_TOOL_NAME)
 
-    def _build_session(self) -> BrowserSession:
+    def _build_session(self, cdp_url: str | None) -> BrowserSession:
         """A fresh session, merging the profile with the capability's overrides.
 
         `BrowserSession` itself merges a provided `browser_profile` with directly
@@ -518,12 +638,30 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
         else:
             browser_profile = browser_profile.model_copy(update={'block_ip_addresses': False})
         return BrowserSession(
-            cdp_url=self._cdp_url,
+            cdp_url=cdp_url,
             browser_profile=browser_profile,
             headless=headless,
             allowed_domains=allowed_domains,
             keep_alive=True if self._session_scope == 'agent' else None,
         )
+
+    async def _acquire_lease(self) -> BrowserLease | None:
+        """Lease a remote browser for one browse, or `None` for a static/local cdp_url."""
+        if self._browser_lease_provider is not None:
+            return await self._browser_lease_provider()
+        return None
+
+    def _lease_cdp_url(self, lease: BrowserLease | None) -> str | None:
+        """The endpoint to connect to: the lease's when leased, else the static url."""
+        return lease.cdp_url if lease is not None else self._cdp_url
+
+    async def _teardown(self, session: BrowserSession | None, lease: BrowserLease | None) -> None:
+        """Tear down a session and its lease, retaining them if cleanup needs a retry."""
+        resource = _PendingResource(session=session, lease=lease)
+        with anyio.CancelScope(shield=True):
+            if not await _cleanup(resource):
+                async with self._cleanup_lock:
+                    self._pending_cleanup.append(resource)
 
     async def _run_agent(self, task: str, session: BrowserSession) -> BrowserAgentHistory:
         """Build the sub-agent for `task` against `session` and run its loop."""
@@ -590,20 +728,13 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
             history = await self._run_in_shared_session(task)
         return self._render_result(history)
 
-    async def _close_session(self, session: BrowserSession) -> None:
-        """Close `session`, retaining its identity when cleanup needs another attempt."""
-        with anyio.CancelScope(shield=True):
-            if not await _kill(session):
-                async with self._cleanup_lock:
-                    self._pending_cleanup.append(session)
-
     async def _retry_pending_cleanup(self) -> None:
-        """Retry sessions whose previous teardown failed or timed out."""
+        """Retry leased browsers whose previous teardown failed or timed out."""
         async with self._cleanup_lock:
             pending, self._pending_cleanup = self._pending_cleanup, []
-            for session in pending:
-                if not await _kill(session):
-                    self._pending_cleanup.append(session)
+            for resource in pending:
+                if not await _cleanup(resource):
+                    self._pending_cleanup.append(resource)
 
     async def _run_in_fresh_session(self, task: str) -> BrowserAgentHistory:
         """One disposable session for one call, killed when the call ends, on success or failure."""
@@ -612,16 +743,21 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
             await self._retry_pending_cleanup()
             self._active_call_sessions += 1
         session: BrowserSession | None = None
+        lease: BrowserLease | None = None
         try:
-            session = self._build_session()
+            lease = await self._acquire_lease()
+            session = self._build_session(self._lease_cdp_url(lease))
             return await self._run_agent(task, session)
         finally:
             with anyio.CancelScope(shield=True):
-                if session is not None:
-                    await self._close_session(session)
-                async with self._call_condition:
-                    self._active_call_sessions -= 1
-                    self._call_condition.notify_all()
+                try:
+                    await self._teardown(session, lease)
+                finally:
+                    # The slot must be returned even if teardown itself raises,
+                    # or `aclose()` waits for a session that no longer exists.
+                    async with self._call_condition:
+                        self._active_call_sessions -= 1
+                        self._call_condition.notify_all()
 
     async def _run_in_shared_session(self, task: str) -> BrowserAgentHistory:
         """The `'agent'`-scoped shared session; the lock serializes calls -- one browser, one driver at a time."""
@@ -635,14 +771,23 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
                     'cannot open another one. Build a new capability to browse again.'
                 )
             if self._shared_session is None:
-                self._shared_session = self._build_session()
+                lease = await self._acquire_lease()
+                try:
+                    self._shared_session = self._build_session(self._lease_cdp_url(lease))
+                except BaseException:
+                    # Building the session failed after the lease was acquired;
+                    # release the leased browser rather than leak it.
+                    await self._teardown(None, lease)
+                    raise
+                self._shared_lease = lease
             try:
                 return await self._run_agent(task, self._shared_session)
             except BaseException:
                 # A failed or cancelled run can leave the shared browser in an
-                # unknown state; kill it so the next call starts fresh. Dropping
+                # unknown state; tear it down so the next call starts fresh.
                 session, self._shared_session = self._shared_session, None
-                await self._close_session(session)
+                lease, self._shared_lease = self._shared_lease, None
+                await self._teardown(session, lease)
                 raise
 
     async def aclose(self) -> None:
@@ -674,5 +819,6 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
             self._session_closed = True
             if self._shared_session is not None:
                 session, self._shared_session = self._shared_session, None
-                await self._close_session(session)
+                lease, self._shared_lease = self._shared_lease, None
+                await self._teardown(session, lease)
         await self._retry_pending_cleanup()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
@@ -11,7 +12,9 @@ from pathlib import Path
 from typing import Literal, TypeVar, overload
 
 import anyio
+import httpx
 import pytest
+import websockets
 
 # `browser_use.Agent` is imported from its defining module: the test package
 # `tests/browser_use` shadows the top-level `browser_use` name in pyright's
@@ -35,6 +38,7 @@ from pydantic_ai_harness.browser_use import (
     BrowserAgent,
     BrowserAgentHistory,
     BrowserAgentSettings,
+    BrowserLease,
     BrowserTask,
     BrowserUse,
     BrowserUseToolset,
@@ -836,7 +840,7 @@ class TestTeardownFailure:
         ]
 
     async def test_session_build_failure_releases_the_call_slot(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def fail_to_build(self: BrowserUseToolset[None]) -> BrowserSession:
+        def fail_to_build(self: BrowserUseToolset[None], cdp_url: str | None) -> BrowserSession:
             raise RuntimeError('browser session could not be created')
 
         monkeypatch.setattr(BrowserUseToolset, '_build_session', fail_to_build)
@@ -1307,6 +1311,7 @@ class TestAgentSpec:
         assert capability.output_schema is None
         assert capability.agent_settings is None
         assert capability.browser_agent is None
+        assert capability.browser_lease_provider is None
 
     def test_agent_loads_from_spec_file(self, tmp_path: Path) -> None:
         spec = tmp_path / 'agent.yaml'
@@ -1487,3 +1492,508 @@ class TestLocalFileNavigation:
         assert await self._navigation_allowed(session, 'file://intranet.example/etc/passwd') is False
         assert await self._navigation_allowed(session, 'http://intranet.example/x') is True
         assert await self._navigation_allowed(session, 'https://intranet.example/x') is False
+
+
+class _FakeProvider:
+    """A `BrowserLeaseProvider` double: records leases acquired and released.
+
+    `acquire_error` makes acquisition fail. `release_fail_times` makes the first
+    N releases raise before one succeeds (each successful release appends to
+    `released`); `release_hangs` makes release block forever (for timeout tests).
+    """
+
+    def __init__(
+        self,
+        url: str = 'ws://leased:1/',
+        *,
+        acquire_error: Exception | None = None,
+        release_fail_times: int = 0,
+        release_hangs: bool = False,
+    ) -> None:
+        self.url = url
+        self.acquire_error = acquire_error
+        self.release_fail_times = release_fail_times
+        self.release_hangs = release_hangs
+        self.acquired = 0
+        self.release_calls = 0
+        self.released: list[str] = []
+
+    async def __call__(self) -> BrowserLease:
+        self.acquired += 1
+        if self.acquire_error is not None:
+            raise self.acquire_error
+        url = self.url
+
+        async def release() -> None:
+            self.release_calls += 1
+            if self.release_hangs:
+                await anyio.sleep_forever()
+            if self.release_calls <= self.release_fail_times:
+                raise RuntimeError('lease release failed')
+            self.released.append(url)
+
+        return BrowserLease(cdp_url=url, release=release)
+
+
+class _FakeSteelSocket:
+    """A CDP endpoint that accepts the readiness probe."""
+
+    def __init__(self, fake: _FakeSteel) -> None:
+        self._fake = fake
+
+    async def __aenter__(self) -> _FakeSteelSocket:
+        self._fake.probes += 1
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+
+class _FakeSteel:
+    """Self-hosted Steel's API with the sharp edges the docs warn about.
+
+    One browser serves one live session at a time; a create without a JSON body
+    is rejected; release ends whichever session is live whatever id it is given;
+    and `websocketUrl` advertises an address the client may not be able to reach.
+    `broken` arms the next session's status lookup to fail with a non-JSON error,
+    `vanishing` arms a release that loses a race and 404s.
+    """
+
+    def __init__(self) -> None:
+        self.requests: list[httpx.Request] = []
+        self.live: str | None = None
+        self.count = 0
+        self.probes = 0
+        self.broken = False
+        self.vanishing = False
+        self.transport = httpx.MockTransport(self.handle)
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        path = request.url.path
+        if path == '/v1/sessions':
+            if not request.content:
+                return httpx.Response(400, json={'message': 'body must be object'})
+            self.count += 1
+            self.live = 'sess-broken' if self.broken else f'sess-{self.count}'
+            return httpx.Response(200, json={'id': self.live, 'websocketUrl': 'ws://unroutable:3000/'})
+        if path.endswith('/release'):
+            if self.vanishing or self.live is None:
+                return httpx.Response(404, json={'message': 'not found'})
+            self.live = None  # the id is ignored: the live session dies
+            return httpx.Response(200, json={})
+        session_id = path.rsplit('/', 1)[-1]
+        if session_id == 'sess-broken':
+            return httpx.Response(500, text='<html>gateway blew up</html>')
+        return httpx.Response(200, json={'id': session_id, 'status': 'live' if session_id == self.live else 'released'})
+
+    def socket(self, *args: object, **kwargs: object) -> _FakeSteelSocket:
+        return _FakeSteelSocket(self)
+
+    @property
+    def paths(self) -> list[str]:
+        return [f'{r.method} {r.url.path}' for r in self.requests]
+
+    async def provider(self) -> BrowserLease:
+        """The provider body the docs show, verbatim in shape."""
+        async with httpx.AsyncClient(base_url='http://steel', transport=self.transport) as client:
+            response = await client.post('/v1/sessions', json={})
+            response.raise_for_status()
+            session = response.json()
+
+        for _ in range(30):
+            try:
+                async with websockets.connect('ws://steel:3000/', open_timeout=5):
+                    break
+            except (OSError, websockets.exceptions.WebSocketException):  # pragma: no cover
+                await anyio.sleep(0)
+        else:  # pragma: no cover
+            raise RuntimeError('the Steel session never became reachable over CDP')
+
+        async def release() -> None:
+            async with httpx.AsyncClient(base_url='http://steel', transport=self.transport) as client:
+                current = await client.get(f'/v1/sessions/{session["id"]}')
+                if current.status_code == 404:
+                    return
+                current.raise_for_status()
+                if current.json().get('status') != 'live':
+                    return
+                released = await client.post(f'/v1/sessions/{session["id"]}/release')
+                if released.status_code != 404:
+                    released.raise_for_status()
+
+        return BrowserLease(cdp_url='ws://steel:3000/', release=release)
+
+
+class TestBrowserLeaseProvider:
+    async def test_leases_per_call_and_releases_on_success(self, kill_calls: list[BrowserSession]) -> None:
+        provider = _FakeProvider()
+        factory = _success_factory()
+        toolset = BrowserUse[None](browser_agent=factory, browser_lease_provider=provider).get_toolset()
+
+        await toolset.browse_web('task')
+
+        assert factory.requests[0].browser_session.cdp_url == 'ws://leased:1/'
+        assert provider.acquired == 1
+        assert provider.released == ['ws://leased:1/']
+
+    async def test_releases_when_run_raises(self, kill_calls: list[BrowserSession]) -> None:
+        provider = _FakeProvider()
+        factory = _FakeFactory(_FakeBrowserAgent(_FakeHistory(), error=RuntimeError('browser crashed')))
+        toolset = BrowserUse[None](browser_agent=factory, browser_lease_provider=provider).get_toolset()
+
+        with pytest.raises(RuntimeError, match='browser crashed'):
+            await toolset.browse_web('task')
+
+        assert provider.released == ['ws://leased:1/']
+
+    async def test_releases_when_cancelled(self, kill_calls: list[BrowserSession]) -> None:
+        provider = _FakeProvider()
+        running = anyio.Event()
+
+        class _HangingAgent:
+            async def run(self, max_steps: int = 500) -> _FakeHistory:
+                running.set()
+                await anyio.sleep_forever()
+                raise AssertionError('unreachable')  # pragma: no cover
+
+        def factory(request: BrowserTask) -> _HangingAgent:
+            return _HangingAgent()
+
+        toolset = BrowserUse[None](browser_agent=factory, browser_lease_provider=provider).get_toolset()
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(toolset.browse_web, 'task')
+            await running.wait()
+            task_group.cancel_scope.cancel()
+
+        assert provider.released == ['ws://leased:1/']
+
+    async def test_acquire_failure_propagates_without_release(self, kill_calls: list[BrowserSession]) -> None:
+        provider = _FakeProvider(acquire_error=RuntimeError('no session available'))
+        toolset = BrowserUse[None](browser_agent=_success_factory(), browser_lease_provider=provider).get_toolset()
+
+        with pytest.raises(RuntimeError, match='no session available'):
+            await toolset.browse_web('task')
+
+        assert provider.acquired == 1
+        assert provider.release_calls == 0
+        assert not kill_calls
+
+    async def test_build_failure_releases_the_lease_once(
+        self, monkeypatch: pytest.MonkeyPatch, kill_calls: list[BrowserSession]
+    ) -> None:
+        def fail_to_build(self: BrowserUseToolset[None], cdp_url: str | None) -> BrowserSession:
+            raise RuntimeError('browser session could not be created')
+
+        monkeypatch.setattr(BrowserUseToolset, '_build_session', fail_to_build)
+        provider = _FakeProvider()
+        toolset = BrowserUse[None](browser_agent=_success_factory(), browser_lease_provider=provider).get_toolset()
+
+        with pytest.raises(RuntimeError, match='could not be created'):
+            await toolset.browse_web('task')
+
+        assert provider.acquired == 1
+        assert provider.released == ['ws://leased:1/']
+
+    async def test_agent_scope_build_failure_releases_the_lease_once(
+        self, monkeypatch: pytest.MonkeyPatch, kill_calls: list[BrowserSession]
+    ) -> None:
+        def fail_to_build(self: BrowserUseToolset[None], cdp_url: str | None) -> BrowserSession:
+            raise RuntimeError('browser session could not be created')
+
+        monkeypatch.setattr(BrowserUseToolset, '_build_session', fail_to_build)
+        provider = _FakeProvider()
+        toolset = BrowserUse[None](
+            session_scope='agent', browser_agent=_success_factory(), browser_lease_provider=provider
+        ).get_toolset()
+
+        with pytest.raises(RuntimeError, match='could not be created'):
+            await toolset.browse_web('task')
+
+        assert provider.released == ['ws://leased:1/']
+        # A build failure must not wedge the shared session in a half-open state.
+        await toolset.aclose()
+        assert provider.acquired == 1
+
+    async def test_failed_release_is_retained_and_retried_next_call(self, kill_calls: list[BrowserSession]) -> None:
+        provider = _FakeProvider(release_fail_times=1)
+        toolset = BrowserUse[None](browser_agent=_success_factory(), browser_lease_provider=provider).get_toolset()
+
+        await toolset.browse_web('first')
+        # The first release raised, so nothing landed yet; the lease is retained.
+        assert provider.release_calls == 1
+        assert provider.released == []
+        assert len(toolset._pending_cleanup) == 1
+
+        await toolset.browse_web('second')
+        # The next call retries the retained lease before its own work.
+        assert 'ws://leased:1/' in provider.released
+        assert toolset._pending_cleanup == []
+
+    async def test_release_exception_while_unwinding_preserves_original(self, kill_calls: list[BrowserSession]) -> None:
+        provider = _FakeProvider(release_fail_times=5)
+        factory = _FakeFactory(_FakeBrowserAgent(_FakeHistory(), error=RuntimeError('browser crashed')))
+        toolset = BrowserUse[None](browser_agent=factory, browser_lease_provider=provider).get_toolset()
+
+        # The run error propagates; the release failure is swallowed and retained.
+        with pytest.raises(RuntimeError, match='browser crashed'):
+            await toolset.browse_web('task')
+
+        assert provider.release_calls == 1
+        assert len(toolset._pending_cleanup) == 1
+
+    async def test_release_timeout_logs_only_the_timeout(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, kill_calls: list[BrowserSession]
+    ) -> None:
+        """A timed-out release reports the timeout, not a spurious failure too.
+
+        `move_on_after` is inside the teardown shield, so its cancellation is
+        delivered as a `CancelledError` at the same await the failure handler
+        catches -- reporting both would blame the callback for the timeout.
+        """
+        monkeypatch.setattr('pydantic_ai_harness.browser_use._toolset._TEARDOWN_TIMEOUT', 0)
+        provider = _FakeProvider(release_hangs=True)
+        toolset = BrowserUse[None](browser_agent=_success_factory(), browser_lease_provider=provider).get_toolset()
+
+        with caplog.at_level(logging.WARNING):
+            assert await toolset.browse_web('go') == 'done'
+
+        assert 'browser lease release timed out after 0 seconds' in caplog.text
+        assert 'browser lease release failed' not in caplog.text
+
+    async def test_release_timeout_is_logged_and_retained(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, kill_calls: list[BrowserSession]
+    ) -> None:
+        monkeypatch.setattr('pydantic_ai_harness.browser_use._toolset._TEARDOWN_TIMEOUT', 0)
+        provider = _FakeProvider(release_hangs=True)
+        toolset = BrowserUse[None](browser_agent=_success_factory(), browser_lease_provider=provider).get_toolset()
+
+        with caplog.at_level(logging.WARNING):
+            assert await toolset.browse_web('go') == 'done'
+
+        assert 'browser lease release timed out after 0 seconds' in caplog.text
+        assert len(toolset._pending_cleanup) == 1
+
+    async def test_agent_scope_leases_once_and_releases_on_aclose(self, kill_calls: list[BrowserSession]) -> None:
+        provider = _FakeProvider()
+        factory = _success_factory()
+        toolset = BrowserUse[None](
+            session_scope='agent', browser_agent=factory, browser_lease_provider=provider
+        ).get_toolset()
+
+        await toolset.browse_web('a')
+        await toolset.browse_web('b')
+
+        assert provider.acquired == 1
+        assert provider.released == []
+        assert factory.requests[0].browser_session is factory.requests[1].browser_session
+
+        await toolset.aclose()
+        assert provider.released == ['ws://leased:1/']
+
+    async def test_aclose_retries_a_failed_release(self, kill_calls: list[BrowserSession]) -> None:
+        provider = _FakeProvider(release_fail_times=1)
+        toolset = BrowserUse[None](
+            session_scope='agent', browser_agent=_success_factory(), browser_lease_provider=provider
+        ).get_toolset()
+
+        await toolset.browse_web('a')
+        await toolset.aclose()
+
+        # aclose's teardown release raised, then its own pending-cleanup retry succeeded.
+        assert provider.release_calls == 2
+        assert provider.released == ['ws://leased:1/']
+        assert toolset._pending_cleanup == []
+
+    async def test_repeated_aclose_does_not_release_twice(self, kill_calls: list[BrowserSession]) -> None:
+        provider = _FakeProvider()
+        toolset = BrowserUse[None](
+            session_scope='agent', browser_agent=_success_factory(), browser_lease_provider=provider
+        ).get_toolset()
+
+        await toolset.browse_web('a')
+        await toolset.aclose()
+        await toolset.aclose()
+
+        assert provider.release_calls == 1
+        assert provider.released == ['ws://leased:1/']
+
+    async def test_release_success_drops_a_failed_session_kill(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def failing_kill(self: BrowserSession) -> None:
+            raise RuntimeError('kill failed')
+
+        monkeypatch.setattr(BrowserSession, 'kill', failing_kill)
+        provider = _FakeProvider()
+        toolset = BrowserUse[None](browser_agent=_success_factory(), browser_lease_provider=provider).get_toolset()
+
+        await toolset.browse_web('task')
+
+        # The client kill failed, but the lease released the remote browser, so
+        # retrying the kill is moot: nothing is retained.
+        assert provider.released == ['ws://leased:1/']
+        assert toolset._pending_cleanup == []
+
+    async def test_concurrent_calls_pair_each_lease_with_its_session(self, kill_calls: list[BrowserSession]) -> None:
+        class _CountingProvider(_FakeProvider):
+            async def __call__(self) -> BrowserLease:
+                self.acquired += 1
+                url = f'ws://leased:{self.acquired}/'
+
+                async def release() -> None:
+                    self.released.append(url)
+
+                return BrowserLease(cdp_url=url, release=release)
+
+        provider = _CountingProvider()
+        both_running = anyio.Event()
+        release_run = anyio.Event()
+        started = 0
+        requests: list[BrowserTask] = []
+
+        class _BarrierAgent:
+            async def run(self, max_steps: int = 500) -> _FakeHistory:
+                nonlocal started
+                started += 1
+                if started == 2:
+                    both_running.set()
+                await release_run.wait()
+                return _FakeHistory(result='done', success=True)
+
+        def factory(request: BrowserTask) -> _BarrierAgent:
+            requests.append(request)
+            return _BarrierAgent()
+
+        toolset = BrowserUse[None](browser_agent=factory, browser_lease_provider=provider).get_toolset()
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(toolset.browse_web, 'a')
+            task_group.start_soon(toolset.browse_web, 'b')
+            await both_running.wait()
+            release_run.set()
+
+        cdp_urls = {request.browser_session.cdp_url for request in requests}
+        assert cdp_urls == {'ws://leased:1/', 'ws://leased:2/'}
+        assert sorted(provider.released) == ['ws://leased:1/', 'ws://leased:2/']
+
+    async def test_release_raising_cancelled_is_retained_and_the_slot_freed(
+        self, kill_calls: list[BrowserSession]
+    ) -> None:
+        """A release callback raising `CancelledError` is a failure, not an escape.
+
+        It must be retained for retry like any other failed release, and the
+        call-slot accounting must still run, or `aclose()` waits forever for a
+        session that no longer exists.
+        """
+
+        class _CancellingProvider(_FakeProvider):
+            async def __call__(self) -> BrowserLease:
+                self.acquired += 1
+
+                async def release() -> None:
+                    self.release_calls += 1
+                    if self.release_calls == 1:
+                        raise asyncio.CancelledError()
+                    self.released.append(self.url)
+
+                return BrowserLease(cdp_url=self.url, release=release)
+
+        provider = _CancellingProvider()
+        toolset = BrowserUse[None](browser_agent=_success_factory(), browser_lease_provider=provider).get_toolset()
+
+        assert await toolset.browse_web('task') == 'done'
+        assert len(toolset._pending_cleanup) == 1  # retained, not lost
+
+        with anyio.fail_after(2):  # must not hang on the un-freed slot
+            await toolset.aclose()
+        assert provider.released == [provider.url]  # retried and released
+
+    async def test_documented_http_provider_leases_and_releases(
+        self, monkeypatch: pytest.MonkeyPatch, kill_calls: list[BrowserSession]
+    ) -> None:
+        """The provider the docs show, driven through a browse against a fake Steel.
+
+        `_FakeSteel.provider` tracks the documented snippet, so a defect in either
+        shows up here.
+        """
+        fake = _FakeSteel()
+        monkeypatch.setattr(websockets, 'connect', fake.socket)
+        factory = _success_factory()
+        toolset = BrowserUse[None](browser_agent=factory, browser_lease_provider=fake.provider).get_toolset()
+
+        assert await toolset.browse_web('task') == 'done'
+
+        # The endpoint comes from the URL Steel was reached on, never the
+        # unroutable address it advertises, and the lease waits for CDP first.
+        assert factory.requests[0].browser_session.cdp_url == 'ws://steel:3000/'
+        assert fake.probes == 1
+        assert fake.paths == [
+            'POST /v1/sessions',
+            'GET /v1/sessions/sess-1',
+            'POST /v1/sessions/sess-1/release',
+        ]
+        assert fake.live is None
+
+    async def test_documented_provider_release_guards(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The release guards the docs describe, against the same fake."""
+        fake = _FakeSteel()
+        monkeypatch.setattr(websockets, 'connect', fake.socket)
+
+        # A retained release from a finished lease must not end the next call's
+        # browser: the harness retries releases, and the id buys no protection.
+        finished = await fake.provider()
+        current = await fake.provider()
+        assert fake.live == 'sess-2'
+        await finished.release()
+        assert fake.live == 'sess-2'
+
+        # A release that 404s lost a race -- the session went away between the
+        # ownership check and the release -- which is idempotent success.
+        fake.vanishing = True
+        await current.release()
+        fake.vanishing = False
+        fake.live = None
+
+        # An error on the ownership check is not a JSON body, so the release must
+        # raise on status rather than blow up decoding; the harness then retains
+        # the lease and retries it.
+        fake.broken = True
+        doomed = await fake.provider()
+        with pytest.raises(httpx.HTTPStatusError):
+            await doomed.release()
+
+    def test_toolset_rejects_cdp_url_and_provider(self) -> None:
+        with pytest.raises(ValueError, match='not both'):
+            BrowserUseToolset[None](
+                browser_agent=default_browser_agent,
+                llm=None,
+                browser_profile=None,
+                allowed_domains=None,
+                block_ip_addresses=True,
+                headless=None,
+                max_steps=5,
+                use_vision=True,
+                output_schema=None,
+                sensitive_data=None,
+                extend_system_message=None,
+                settings=BrowserAgentSettings(),
+                session_scope='call',
+                cdp_url='ws://x/',
+                browser_lease_provider=_FakeProvider(),
+            )
+
+    def test_cdp_url_and_provider_are_mutually_exclusive(self) -> None:
+        with pytest.raises(ValueError, match='not both'):
+            BrowserUse[None](cdp_url='ws://x/', browser_lease_provider=_FakeProvider())
+
+    def test_mutual_exclusion_is_rechecked_after_mutation(self) -> None:
+        capability = BrowserUse[None](cdp_url='ws://x/')
+        capability.browser_lease_provider = _FakeProvider()
+        with pytest.raises(ValueError, match='not both'):
+            capability.get_toolset()
+
+    def test_credential_bearing_url_is_absent_from_repr(self) -> None:
+        async def release() -> None: ...
+
+        lease = BrowserLease(cdp_url='wss://token-deadbeef@remote:9222/', release=release)
+        assert 'deadbeef' not in repr(lease)

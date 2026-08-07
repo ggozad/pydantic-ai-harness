@@ -253,7 +253,9 @@ origin.
   (a container, a hosted browser service) instead of launching one locally.
   Ending a call disconnects from an attached browser rather than terminating
   it -- browser-use only kills a browser process it launched itself -- so a
-  browser you manage survives `'call'` scope.
+  browser you manage survives `'call'` scope. For a freshly-provisioned remote
+  browser per call rather than one shared one, use `browser_lease_provider`
+  (see [Per-call remote isolation](#per-call-remote-isolation)).
 - **Telemetry.** browser-use collects anonymized telemetry by default; set
   `ANONYMIZED_TELEMETRY=false` to disable it.
 
@@ -262,7 +264,11 @@ origin.
 `session_scope` controls how long a browser lives:
 
 - `'call'` (the default): every `browse_web` call gets a fresh session, killed
-  when the call ends when cleanup succeeds. No browser state carries over.
+  when the call ends when cleanup succeeds. A locally-launched browser is fully
+  isolated per call; a static `cdp_url`, though, shares one remote browser
+  across calls, so its cookies and tabs still carry over -- use
+  `browser_lease_provider` (see [Per-call remote isolation](#per-call-remote-isolation))
+  for a fresh remote browser each call.
 - `'agent'`: one session is kept alive and reused across calls -- tabs,
   logins, and page state carry over, and calls are serialized on the shared
   browser. Close it with `aclose()`, or use the capability as an async context
@@ -294,6 +300,119 @@ durable execution, use the default `'call'` scope so each tool invocation owns
 its browser, and validate that composition for the durability integration you
 use; the capability does not currently include durability integration tests.
 
+## Per-call remote isolation
+
+A static `cdp_url` points every call at **one** browser, so over `'call'` scope
+its cookies and tabs still carry across calls (browser-use attaches to the
+remote browser's existing context and only disconnects at the end). To give each
+call its own freshly-provisioned remote browser, set `browser_lease_provider`
+instead: an async callable that leases a browser per call and releases it when
+the call ends.
+
+```python
+import asyncio
+
+import httpx
+import websockets
+
+from pydantic_ai_harness.browser_use import BrowserLease, BrowserUse
+
+STEEL_URL = 'http://localhost:3000'
+# Steel serves CDP on its own root and hands every lease the same endpoint, so
+# derive it from the URL you reach Steel on rather than the `websocketUrl` it
+# returns: that advertises the container's own `HOST`/`DOMAIN`, which may be
+# unroutable from here, and Chrome refuses a CDP upgrade whose `Host` header is
+# a name rather than an IP.
+CDP_URL = 'ws://127.0.0.1:3000/'
+
+
+async def steel_provider() -> BrowserLease:
+    async with httpx.AsyncClient(base_url=STEEL_URL) as client:
+        # The body is required: Steel rejects a bodyless create with 400.
+        response = await client.post('/v1/sessions', json={})
+        response.raise_for_status()  # httpx does not raise for 4xx/5xx on its own
+        session = response.json()
+
+    # Steel returns before the browser is accepting CDP connections, and it
+    # relaunches Chromium whenever one drops, so a lease handed back too early
+    # makes the next `browse_web` fail. Wait for the endpoint to open.
+    for _ in range(30):
+        try:
+            async with websockets.connect(CDP_URL, open_timeout=5):
+                break
+        # A refused connection or timeout is `OSError`; a browser that is up but
+        # not ready rejects the upgrade with an HTTP status, which surfaces as
+        # `InvalidStatus` -- a `WebSocketException`, not an `OSError`.
+        except (OSError, websockets.exceptions.WebSocketException):
+            await asyncio.sleep(0.5)
+    else:
+        raise RuntimeError('the Steel session never became reachable over CDP')
+
+    async def release() -> None:
+        async with httpx.AsyncClient(base_url=STEEL_URL) as client:
+            # Steel's release ends whichever session is active and ignores this
+            # id, so check the lease still owns the browser first: a retried
+            # release runs later, when another call may have taken over.
+            current = await client.get(f'/v1/sessions/{session["id"]}')
+            if current.status_code == 404:
+                return  # already gone: nothing of ours left to end
+            current.raise_for_status()
+            if current.json().get('status') != 'live':
+                return  # another call owns the browser now
+            response = await client.post(f'/v1/sessions/{session["id"]}/release')
+            if response.status_code != 404:  # a 404 means it just went away
+                response.raise_for_status()
+
+    return BrowserLease(cdp_url=CDP_URL, release=release)
+
+
+BrowserUse(browser_lease_provider=steel_provider, session_scope='call')
+```
+
+**The backend decides whether isolation is concurrent.** A lease is only as
+isolated as the browser behind it. Self-hosted Steel (the OSS image above) runs
+one Chromium: it tracks a single active session, hands every lease the same
+WebSocket URL, and its release endpoint ignores the session id. That still gives
+*sequential* freshness -- each call starts clean and hands the browser back --
+but two concurrent `browse_web` calls would share, replace, or terminate each
+other's browser. For concurrent isolation the provider must talk to a backend
+that provisions an **independent browser per session** (a hosted browser
+service, or a pool of one-browser instances the provider assigns from). Keep
+concurrency in mind if the same capability serves several agents or users at
+once.
+
+- **Types.** `BrowserLease` is a frozen dataclass of `cdp_url: str` (excluded
+  from `repr`, since remote endpoints often carry credentials) and an async
+  `release`. `BrowserLeaseProvider` is a `Protocol` for the callable itself, so
+  any callable returning an awaitable `BrowserLease` satisfies it.
+- **Mutual exclusion.** Set either `cdp_url` or `browser_lease_provider`, not
+  both (validated at construction and when the toolset is built).
+- **`'call'` scope.** A lease is acquired per call and released when the call
+  ends -- on success, on a failed or cancelled run, and if building the session
+  fails after the lease was acquired.
+- **`'agent'` scope.** One lease is acquired for the shared session and reused
+  across calls; it is released when the session is torn down (a failed run or
+  `aclose()`).
+- **Acquisition** is not shielded, so a cancelled run can cancel a provider
+  mid-flight; a provider that has already created a remote session must clean it
+  up itself, since the harness never saw a lease for it. Acquisition failures
+  propagate out of `browse_web` as ordinary exceptions and abort the agent run --
+  they are not `ModelRetry`, so the model does not see or retry them. Raise
+  `ModelRetry` from the provider if the model should recover instead.
+- **Release** runs in a shielded, time-bounded teardown; a failed or timed-out
+  release is logged and retained, then retried by the next `browse_web` or by
+  `aclose()`. So `release` must be idempotent and scoped to its own lease: a
+  retry can run after another call has taken over the backend, and it must not
+  tear down a browser it no longer owns. A backend whose release is not
+  id-scoped needs a guard -- self-hosted Steel ends whichever session is active
+  whatever id it is given, so the example checks the lease is still live first.
+  A successful release supersedes a failed client-side session kill -- the
+  remote browser is already gone.
+- **Credentials.** A leased `cdp_url` may embed a token; it is kept out of
+  `repr`. Treat the endpoint as a secret in your provider.
+- **Specs.** Like `browser_agent`, a provider is not spec-serializable;
+  instances loaded from an agent spec have no provider.
+
 ## Instructions
 
 The capability contributes short delegation guidance to the system prompt:
@@ -324,6 +443,7 @@ BrowserUse(
     agent_settings=None,         # BrowserAgentSettings: supported Agent options
     session_scope='call',        # 'call' = fresh browser per call; 'agent' = one shared session
     cdp_url=None,                # attach to a remote Chromium over CDP; overrides the profile
+    browser_lease_provider=None, # BrowserLeaseProvider: lease a fresh remote browser per call (excludes cdp_url)
     guidance=None,               # host-model instructions: None = default, '' = none, str = custom
     browser_agent=None,          # BrowserAgentFactory; None builds a real browser_use.Agent
 )
@@ -409,10 +529,11 @@ from pydantic_ai_harness import BrowserUse
 agent = Agent.from_file('agent.yaml', custom_capability_types=[BrowserUse])
 ```
 
-The `llm`, `browser_profile`, `output_schema`, `agent_settings`, and
-`browser_agent` fields are not spec-serializable; spec-loaded instances use
-browser-use's own default model selection and browser and agent configuration,
-prose output, and the default agent factory.
+The `llm`, `browser_profile`, `output_schema`, `agent_settings`,
+`browser_agent`, and `browser_lease_provider` fields are not spec-serializable;
+spec-loaded instances use browser-use's own default model selection and browser
+and agent configuration, prose output, the default agent factory, and no lease
+provider.
 
 
 ## Further reading
@@ -438,3 +559,7 @@ prose output, and the default agent factory.
 ::: pydantic_ai_harness.browser_use.BrowserAgent
 
 ::: pydantic_ai_harness.browser_use.BrowserAgentHistory
+
+::: pydantic_ai_harness.browser_use.BrowserLease
+
+::: pydantic_ai_harness.browser_use.BrowserLeaseProvider

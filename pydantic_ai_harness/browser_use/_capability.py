@@ -13,6 +13,7 @@ from pydantic_ai_harness.browser_use._model import ChatModelInput, resolve_chat_
 from pydantic_ai_harness.browser_use._settings import BrowserAgentSettings
 from pydantic_ai_harness.browser_use._toolset import (
     BrowserAgentFactory,
+    BrowserLeaseProvider,
     BrowserUseToolset,
     _normalize_allowed_domains,  # pyright: ignore[reportPrivateUsage]
     _normalize_profile_allowed_domains,  # pyright: ignore[reportPrivateUsage]
@@ -221,6 +222,22 @@ class BrowserUse(AbstractCapability[AgentDepsT]):
     Kept out of `repr()` because hosted endpoints can include credentials.
     """
 
+    browser_lease_provider: BrowserLeaseProvider | None = field(default=None, repr=False)
+    """Lease a fresh remote browser per `browse_web` call instead of a static `cdp_url`.
+
+    An async callable returning a `BrowserLease` (its `cdp_url` plus a `release`
+    coroutine). Each call leases a browser, attaches to it, and releases it when
+    the call ends -- so every browse gets its own isolated remote session (e.g.
+    a Steel session created and released per call), rather than sharing one
+    long-lived browser. In `'agent'` scope one lease is acquired and reused
+    across calls, released when the session is torn down. `release` runs in a
+    shielded, time-bounded teardown, on success, failure, and cancellation, and
+    is retried if it fails or times out, so it must be idempotent.
+
+    Mutually exclusive with `cdp_url`. Not spec-serializable (like
+    `browser_agent`); spec-loaded instances have no provider.
+    """
+
     guidance: str | None = None
     """Custom delegation guidance for the system prompt.
 
@@ -241,7 +258,17 @@ class BrowserUse(AbstractCapability[AgentDepsT]):
 
     def __post_init__(self) -> None:
         """Require an effective navigation allowlist when flat secrets are configured."""
+        self._validate_lease_config()
         self._validate_sensitive_data()
+
+    def _validate_lease_config(self) -> None:
+        """A static `cdp_url` and a lease provider are mutually exclusive.
+
+        Re-checked in `get_toolset` too, since both fields are mutable after
+        construction.
+        """
+        if self.cdp_url is not None and self.browser_lease_provider is not None:
+            raise ValueError('Set either `cdp_url` or `browser_lease_provider`, not both.')
 
     def _validate_sensitive_data(self) -> None:
         """Validate the mutable secret configuration before creating its toolset."""
@@ -288,6 +315,7 @@ class BrowserUse(AbstractCapability[AgentDepsT]):
         calls do not each spawn their own shared browser.
         """
         if self._toolset is None:
+            self._validate_lease_config()
             self._validate_sensitive_data()
             sensitive_data = _copy_sensitive_data(self.sensitive_data)
             browser_profile = self.browser_profile
@@ -308,19 +336,22 @@ class BrowserUse(AbstractCapability[AgentDepsT]):
                 settings=self.agent_settings if self.agent_settings is not None else BrowserAgentSettings(),
                 session_scope=self.session_scope,
                 cdp_url=self.cdp_url,
+                browser_lease_provider=self.browser_lease_provider,
             )
         return self._toolset
 
     async def aclose(self) -> None:
-        """Kill the shared browser session, if one is alive (`'agent'` scope).
+        """Finish cleanup: kill the shared browser session and retry what failed.
 
         Call it when the capability is no longer needed, or use the capability
-        as an async context manager. In `'agent'` scope it closes for good: a
-        later `browse_web` raises rather than starting a browser that nothing
-        would close. A no-op in `'call'` scope, where no session is retained
-        between calls, and before the first `browse_web` call. It waits for an
-        in-flight `browse_web` call to finish rather than closing the browser
-        under it, so cancel the run first if you need to close sooner.
+        as an async context manager. In `'agent'` scope it closes the shared
+        session for good: a later `browse_web` raises rather than starting a
+        browser that nothing would close. In `'call'` scope no session is
+        retained between calls, but it is still not a no-op -- it retries any
+        session or lease whose earlier teardown failed or timed out, which is
+        the last chance to release a leased remote browser. Either way it waits
+        for an in-flight `browse_web` call to finish rather than closing the
+        browser under it, so cancel the run first if you need to close sooner.
         """
         if self._toolset is not None:
             await self._toolset.aclose()
@@ -355,10 +386,11 @@ class BrowserUse(AbstractCapability[AgentDepsT]):
     ) -> BrowserUse[AgentDepsT]:
         """Construct the capability from serializable spec options.
 
-        The `llm`, `browser_profile`, `output_schema`, `agent_settings`, and
-        `browser_agent` fields are not spec-serializable: spec-loaded instances
-        use browser-use's own default model selection, default browser and
-        agent configuration, prose output, and the default agent factory.
+        The `llm`, `browser_profile`, `output_schema`, `agent_settings`,
+        `browser_agent`, and `browser_lease_provider` fields are not
+        spec-serializable: spec-loaded instances use browser-use's own default
+        model selection, default browser and agent configuration, prose output,
+        the default agent factory, and no lease provider.
         """
         return cls(
             allowed_domains=allowed_domains,
